@@ -17,9 +17,14 @@
 package bn254
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
+	"reflect"
+	"unsafe"
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
+	"github.com/consensys/gnark-crypto/inaccel"
 	"github.com/consensys/gnark-crypto/internal/parallel"
 	"math"
 	"runtime"
@@ -172,6 +177,15 @@ func (p *G1Affine) MultiExp(points []G1Affine, scalars []fr.Element, config ecc.
 	return p, nil
 }
 
+func (p *G1Affine) MultiExpInAccel(points []G1Affine, scalars []fr.Element, config ecc.MultiExpConfig) (*G1Affine, error) {
+	var _p G1Jac
+	if _, err := _p.MultiExpInAccel(points, scalars, config); err != nil {
+		return nil, err
+	}
+	p.FromJacobian(&_p)
+	return p, nil
+}
+
 // MultiExp implements section 4 of https://eprint.iacr.org/2012/549.pdf
 func (p *G1Jac) MultiExp(points []G1Affine, scalars []fr.Element, config ecc.MultiExpConfig) (*G1Jac, error) {
 	// note:
@@ -281,6 +295,103 @@ func (p *G1Jac) MultiExp(points []G1Affine, scalars []fr.Element, config ecc.Mul
 		p.AddAssign(&_p[done])
 	}
 	close(chDone)
+	return p, nil
+}
+
+func (p *G1Jac) MultiExpInAccel(points []G1Affine, scalars []fr.Element, config ecc.MultiExpConfig) (*G1Jac, error) {
+	length := uint64(len(points))
+
+	vecBuf, err := inaccel.Alloc(length * 64)
+	if err != nil {
+		return nil, err
+	}
+	vec := unsafe.Slice((*byte)(vecBuf), length*64)
+
+	scalarBuf, err := inaccel.Alloc(length * 32)
+	if err != nil {
+		return nil, err
+	}
+	scalar := unsafe.Slice((*byte)(scalarBuf), length*32)
+
+	resultBuf, err := inaccel.Alloc(96)
+	if err != nil {
+		return nil, err
+	}
+	result := unsafe.Slice((*byte)(resultBuf), 96)
+
+	i := 0
+	for it := range points {
+		if points[it].IsInfinity() {
+			continue
+		}
+
+		if scalars[it].IsZero() {
+			continue
+		}
+
+		binary.LittleEndian.PutUint64(vec[i*64:i*64+8], points[it].X[0])
+		binary.LittleEndian.PutUint64(vec[i*64+8:i*64+16], points[it].X[1])
+		binary.LittleEndian.PutUint64(vec[i*64+24:i*64+32], points[it].X[3])
+		binary.LittleEndian.PutUint64(vec[i*64+16:i*64+24], points[it].X[2])
+
+		binary.LittleEndian.PutUint64(vec[i*64+32:i*64+40], points[it].Y[0])
+		binary.LittleEndian.PutUint64(vec[i*64+40:i*64+48], points[it].Y[1])
+		binary.LittleEndian.PutUint64(vec[i*64+48:i*64+56], points[it].Y[2])
+		binary.LittleEndian.PutUint64(vec[i*64+56:(i+1)*64], points[it].Y[3])
+
+		if config.ScalarsMont {
+			scalars[it].FromMont()
+		}
+
+		binary.LittleEndian.PutUint64(scalar[i*32:i*32+8], scalars[it][0])
+		binary.LittleEndian.PutUint64(scalar[i*32+8:i*32+16], scalars[it][1])
+		binary.LittleEndian.PutUint64(scalar[i*32+16:i*32+24], scalars[it][2])
+		binary.LittleEndian.PutUint64(scalar[i*32+24:(i+1)*32], scalars[it][3])
+
+		if config.ScalarsMont {
+			scalars[it].ToMont()
+		}
+
+		i++
+	}
+
+	if i == 0 {
+		p.Z.SetZero()
+		p.X.SetOne()
+		p.Y.SetOne()
+
+		return p, nil
+	}
+
+	length = uint64(((i - 1) | 7) + 1)
+
+	tmp := new(bytes.Buffer)
+	if err := binary.Write(tmp, binary.LittleEndian, length); err != nil {
+		return nil, err
+	}
+	if err := <-inaccel.Submit(inaccel.NewRequest("libff.multiexp.alt-bn128-g1").ArgScalar(8, reflect.ValueOf(tmp.Bytes()).UnsafePointer()).ArgArray(uint64(len(vec)), vecBuf).ArgArray(uint64(len(scalar)), scalarBuf).ArgArray(uint64(len(result)), resultBuf)); err != nil {
+		return nil, err
+	}
+
+	p.X[0] = binary.LittleEndian.Uint64(result[0:8])
+	p.X[1] = binary.LittleEndian.Uint64(result[8:16])
+	p.X[2] = binary.LittleEndian.Uint64(result[16:24])
+	p.X[3] = binary.LittleEndian.Uint64(result[24:32])
+
+	p.Y[0] = binary.LittleEndian.Uint64(result[32:40])
+	p.Y[1] = binary.LittleEndian.Uint64(result[40:48])
+	p.Y[2] = binary.LittleEndian.Uint64(result[48:56])
+	p.Y[3] = binary.LittleEndian.Uint64(result[56:64])
+
+	p.Z[0] = binary.LittleEndian.Uint64(result[64:72])
+	p.Z[1] = binary.LittleEndian.Uint64(result[72:80])
+	p.Z[2] = binary.LittleEndian.Uint64(result[80:88])
+	p.Z[3] = binary.LittleEndian.Uint64(result[88:96])
+
+	inaccel.Free(vecBuf)
+	inaccel.Free(scalarBuf)
+	inaccel.Free(resultBuf)
+
 	return p, nil
 }
 
