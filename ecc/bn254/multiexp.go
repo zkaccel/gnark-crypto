@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"reflect"
 	"unsafe"
 	"github.com/consensys/gnark-crypto/ecc"
@@ -391,6 +392,12 @@ func (p *G1Jac) MultiExpInAccel(points []G1Affine, scalars []fr.Element, config 
 	inaccel.Free(vecBuf)
 	inaccel.Free(scalarBuf)
 	inaccel.Free(resultBuf)
+
+	var expected G1Jac
+	if _, err := expected.MultiExp(points, scalars, config); err != nil {
+		return nil, err
+	}
+	fmt.Println(expected.Equal(p))
 
 	return p, nil
 }
